@@ -1,0 +1,17 @@
+{
+  "name": "hungry-snake-simple-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple WebSocket relay server for Hungry Snake multiplayer prototype",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
