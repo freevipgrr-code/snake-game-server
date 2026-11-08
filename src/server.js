@@ -14,7 +14,7 @@ const BORDER_R = 30;
 const HEAD_HIT = 0.45;
 const BODY_HIT = 0.78;
 const BOT_TICK_MS = 33;                 // محاكاة 30 مرة في الثانية
-const BROADCAST_MS = 100;
+const BROADCAST_MS = 60;                 // لقطة العالم ~15 مرة في الثانية
 const MIN_MOVE_INTERVAL_MS = 25;
 const FOOD_TARGET = 3000;
 const MAX_FOOD = 8000;
@@ -351,13 +351,21 @@ wss.on('connection', (ws) => {
       broadcast(room, { type: 'player_joined', player: snapshotWorm(p) }, ws);
       return;
     }
-    if (msg.type === 'ping') return send(ws, { type: 'pong' });
+    if (msg.type === 'ping') return send(ws, { type: 'pong', t: msg.t });
     if (!ws.room) return send(ws, { type: 'error', message: 'Join a room first' });
     if (msg.type === 'leave') { leave(ws); return; }
     if (msg.type === 'input') {
       const p = ws.room.players.get(ws.playerId); if (!p || p.alive === false) return;
+      const now = Date.now();
+      const el = Math.min(0.3, Math.max(0.02, (now - (p.lastInput || now - 40)) / 1000));
+      p.lastInput = now;
       const a = Number(msg.angle);
-      if (Number.isFinite(a)) p.target = clamp(a, -Math.PI * 8, Math.PI * 8, p.target);
+      if (Number.isFinite(a)) {
+        // الجهاز يرسل اتجاهه الفعلي: نتبعه مباشرة (مع حد للدوران يمنع الغش) فيتطابق مسار السيرفر مع شاشة اللاعب
+        const maxTurn = 4.2 * (el + 0.12) * 1.5 + 0.1;
+        p.angle = turnToward(p.angle, clamp(a, -Math.PI * 8, Math.PI * 8, p.angle), maxTurn);
+        p.target = clamp(a, -Math.PI * 8, Math.PI * 8, p.angle);
+      }
       p.boost = Boolean(msg.boost) && p.score > 6;
       return;
     }
