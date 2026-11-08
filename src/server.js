@@ -20,6 +20,8 @@ const FOOD_TARGET = 3000;
 const MAX_FOOD = 8000;
 const VIEW_RANGE = 3200;                // نرسل لكل لاعب من حوله فقط (يقلل البيانات كثيراً)
 const MAX_SEGMENTS = 350;
+const FCELL = 256;                         // شبكة الطعام: نفحص الخلايا القريبة فقط بدل كل الطعام
+const FGW = Math.ceil(WORLD_SIZE / FCELL) + 1;
 const rooms = new Map();
 const COLORS = [0xFF40C4FF, 0xFFFF5252, 0xFF69F0AE, 0xFFFFD740, 0xFFB388FF,
   0xFFFF80AB, 0xFF64FFDA, 0xFFFFAB40, 0xFF8C9EFF, 0xFFE6EE9C];
@@ -95,6 +97,9 @@ function makeFood(room, x, y, color, value) {
   const f = { id: 'f' + (++room.nextFoodId), x: clamp(x, 0, WORLD_SIZE, WORLD_CENTER),
     y: clamp(y, 0, WORLD_SIZE, WORLD_CENTER), c: color | 0, v: clamp(value, 0.1, 1000, 1) };
   room.foods.set(f.id, f);
+  const cx = Math.max(0, Math.min(FGW - 1, (f.x / FCELL) | 0)), cy = Math.max(0, Math.min(FGW - 1, (f.y / FCELL) | 0));
+  f.cell = cy * FGW + cx;
+  (room.fgrid[f.cell] || (room.fgrid[f.cell] = [])).push(f);
   room.foodAdded.push(f);
   return f;
 }
@@ -105,7 +110,7 @@ function spawnFood(room) {
 function foodSnapshot(room) { return [...room.foods.values()]; }
 function getRoom(code) {
   if (!rooms.has(code)) {
-    const room = { code, clients: new Set(), players: new Map(), bots: new Map(), foods: new Map(),
+    const room = { code, clients: new Set(), players: new Map(), bots: new Map(), foods: new Map(), fgrid: new Array(FGW * FGW),
       nextBotId: 0, nextFoodId: 0, foodAdded: [], foodRemoved: [], broadcastT: 0, statsT: 0 };
     for (let i = 0; i < FOOD_TARGET; i++) spawnFood(room);
     room.foodAdded.length = 0;
@@ -198,11 +203,12 @@ function updateBot(room, bot, dt) {
     bot.think -= dt;
     const look = 260, ax = bot.x + Math.cos(bot.angle) * look, ay = bot.y + Math.sin(bot.angle) * look;
     let danger = null, dangerD = Infinity;
-    const others = [...room.players.values(), ...room.bots.values()];
-    for (const other of others) {
-      if (other.id === bot.id || other.alive === false) continue;
-      const dx = other.x - ax, dy = other.y - ay, d2 = dx * dx + dy * dy;
-      if (d2 < 210 * 210 && d2 < dangerD) { danger = other; dangerD = d2; }
+    for (const group of [room.players, room.bots]) {
+      for (const other of group.values()) {
+        if (other.id === bot.id || other.alive === false) continue;
+        const dx = other.x - ax, dy = other.y - ay, d2 = dx * dx + dy * dy;
+        if (d2 < 210 * 210 && d2 < dangerD) { danger = other; dangerD = d2; }
+      }
     }
     if (danger) {
       const cross = Math.cos(bot.angle) * (danger.y - bot.y) - Math.sin(bot.angle) * (danger.x - bot.x);
@@ -293,13 +299,23 @@ function updateFoodAndGrowth(room, w, dt) {
       makeFood(room, tail.x, tail.y, w.color, 1);
     }
   }
-  const r = radius(w.score), eatR = r + 16;
-  for (const [id, f] of room.foods) {
-    const dx = w.x - f.x, dy = w.y - f.y;
-    if (dx * dx + dy * dy <= eatR * eatR) {
-      w.score += f.v;
-      room.foods.delete(id);
-      room.foodRemoved.push(id);
+  const r = radius(w.score), eatR = r + 16, eatR2 = eatR * eatR;
+  const cx0 = Math.max(0, ((w.x - eatR) / FCELL) | 0), cx1 = Math.min(FGW - 1, ((w.x + eatR) / FCELL) | 0);
+  const cy0 = Math.max(0, ((w.y - eatR) / FCELL) | 0), cy1 = Math.min(FGW - 1, ((w.y + eatR) / FCELL) | 0);
+  for (let cy = cy0; cy <= cy1; cy++) {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      const arr = room.fgrid[cy * FGW + cx];
+      if (!arr) continue;
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const f = arr[i], dx = w.x - f.x, dy = w.y - f.y;
+        if (dx * dx + dy * dy <= eatR2) {
+          w.score += f.v;
+          room.foods.delete(f.id);
+          room.foodRemoved.push(f.id);
+          arr[i] = arr[arr.length - 1];
+          arr.pop();
+        }
+      }
     }
   }
 }
@@ -403,9 +419,11 @@ function sendState(room) {
   }
 }
 
+const tickStats = { sum: 0, n: 0, max: 0 };
 let lastTick = Date.now();
 setInterval(() => {
   const now = Date.now(), dt = Math.min(0.1, Math.max(0.001, (now - lastTick) / 1000)); lastTick = now;
+  const tickStart = process.hrtime.bigint();
   for (const room of rooms.values()) {
     if (!room.clients.size) continue;
     processRoom(room, dt);
@@ -420,6 +438,12 @@ setInterval(() => {
         room.foodAdded = []; room.foodRemoved = [];
       }
     }
+  }
+  const ms = Number(process.hrtime.bigint() - tickStart) / 1e6;
+  tickStats.sum += ms; tickStats.n++; tickStats.max = Math.max(tickStats.max, ms);
+  if (tickStats.n >= 150) {            // كل ~5 ثوان: متوسط وأقصى زمن لحلقة السيرفر (مفيد لمراقبة الأداء في Railway Logs)
+    if (process.env.DEBUG_TICKS) console.log(`tick avg ${(tickStats.sum / tickStats.n).toFixed(2)}ms max ${tickStats.max.toFixed(2)}ms`);
+    tickStats.sum = 0; tickStats.n = 0; tickStats.max = 0;
   }
 }, BOT_TICK_MS);
 
