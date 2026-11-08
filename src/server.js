@@ -278,18 +278,20 @@ function checkCollisions(room) {
   const all = [];
   for (const p of room.players.values()) if (p.alive !== false) all.push(p);
   for (const b of room.bots.values()) if (b.alive !== false) all.push(b);
+  
   const grid = room.collisionGrid || (room.collisionGrid = new Array(CGW * CGW));
   const used = room.collisionUsed || (room.collisionUsed = []);
   for (let i = 0; i < used.length; i++) grid[used[i]].length = 0;
   used.length = 0;
 
-  // إدراج كل مقطع في خلية مكانية؛ هذا يحوّل فحص جميع الأجسام إلى فحص الجوار فقط.
+  // إدراج المقاطع في الشبكة المكانية بأمان
   for (let wi = 0; wi < all.length; wi++) {
     const w = all[wi], body = w.body || [];
     for (let si = 0; si < body.length; si++) {
       const q = body[si];
-      const gx = Math.max(0, Math.min(CGW - 1, (q.x / CCELL) | 0));
-      const gy = Math.max(0, Math.min(CGW - 1, (q.y / CCELL) | 0));
+      // حماية صارمة ضد خروج الإحداثيات عن حدود الشبكة
+      const gx = Math.max(0, Math.min(CGW - 1, Math.floor(q.x / CCELL)));
+      const gy = Math.max(0, Math.min(CGW - 1, Math.floor(q.y / CCELL)));
       const cell = gy * CGW + gx;
       let bucket = grid[cell];
       if (!bucket) bucket = grid[cell] = [];
@@ -302,40 +304,72 @@ function checkCollisions(room) {
   for (let wi = 0; wi < all.length; wi++) {
     const w = all[wi];
     if (Date.now() < (w.invulnUntil || 0)) continue;
-    const rr = radius(w.score), cx = w.x - WORLD_CENTER, cy = w.y - WORLD_CENTER;
+    
+    const rr = radius(w.score);
+    const cx = w.x - WORLD_CENTER, cy = w.y - WORLD_CENTER;
     const edge = ARENA_RADIUS - BORDER_R - rr * 0.3;
-    if (cx * cx + cy * cy > edge * edge) { dying.push([w, 'border']); continue; }
+    
+    // التحقق من اصطدام الحدود الخارجية
+    if (cx * cx + cy * cy > edge * edge) {
+      dying.push([w, 'border']);
+      continue;
+    }
 
-    const gx = Math.max(0, Math.min(CGW - 1, (w.x / CCELL) | 0));
-    const gy = Math.max(0, Math.min(CGW - 1, (w.y / CCELL) | 0));
+    const gx = Math.max(0, Math.min(CGW - 1, Math.floor(w.x / CCELL)));
+    const gy = Math.max(0, Math.min(CGW - 1, Math.floor(w.y / CCELL)));
     let dead = false;
+
+    // فحص الخلايا المجاورة بدقة
     for (let yy = Math.max(0, gy - 1); yy <= Math.min(CGW - 1, gy + 1) && !dead; yy++) {
       for (let xx = Math.max(0, gx - 1); xx <= Math.min(CGW - 1, gx + 1) && !dead; xx++) {
         const bucket = grid[yy * CGW + xx];
         if (!bucket) continue;
+        
         for (let k = 0; k < bucket.length; k++) {
           const packed = bucket[k];
           const oi = Math.floor(packed / (MAX_SEGMENTS + 1));
           const si = packed - oi * (MAX_SEGMENTS + 1);
           const other = all[oi];
+
+          // لا تصطدم الأفعى بنفسها، ولا بالأجسام الميتة
           if (other === w || other.alive === false) continue;
+          
           const or = radius(other.score);
+
           if (si === 0) {
+            // تصادم الرأس برأس (Head-to-Head)
             const dx = other.x - w.x, dy = other.y - w.y;
-            const headLimit = (rr + or) * 0.55;
-            if (dx * dx + dy * dy < headLimit * headLimit && w.score <= other.score) { dead = true; break; }
+            const headLimit = (rr + or) * 0.50; // تقليل الهامش قليلاً لزيادة العدالة
+            if (dx * dx + dy * dy < headLimit * headLimit) {
+              // يموت الأصغر حجماً، أو يمتان معاً إذا تساويا
+              if (w.score <= other.score) {
+                dead = true;
+                break;
+              }
+            }
           } else {
+            // تصادم الرأس بجسم أفعى أخرى (Head-to-Body)
             const seg = other.body[si];
             const dx = seg.x - w.x, dy = seg.y - w.y;
-            const lim = rr * HEAD_HIT + bodyRadius(other.score, si, other.body.length) * BODY_HIT;
-            if (dx * dx + dy * dy < lim * lim) { dead = true; break; }
+            
+            // حساب المسافة بدقة مع مراعاة تدرج حجم الحلقات
+            const bRad = bodyRadius(other.score, si, other.body.length);
+            const lim = (rr * HEAD_HIT) + (bRad * BODY_HIT);
+            
+            if (dx * dx + dy * dy < lim * lim) {
+              dead = true;
+              break;
+            }
           }
         }
       }
     }
     if (dead) dying.push([w, 'snake']);
   }
-  for (const [w, reason] of dying) killWorm(room, w, reason);
+
+  for (const [w, reason] of dying) {
+    killWorm(room, w, reason);
+  }
 }
 function updateBounds(w) {
   const body = w.body || [];
