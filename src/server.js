@@ -21,6 +21,8 @@ const MAX_FOOD = 8000;
 const VIEW_RANGE = 3200;                // نرسل لكل لاعب من حوله فقط (يقلل البيانات كثيراً)
 const MAX_SEGMENTS = 350;
 const FCELL = 256;                         // شبكة الطعام: نفحص الخلايا القريبة فقط بدل كل الطعام
+const CCELL = 256;                         // شبكة مكانية للتصادم
+const CGW = Math.ceil(WORLD_SIZE / CCELL) + 1;
 const FGW = Math.ceil(WORLD_SIZE / FCELL) + 1;
 const rooms = new Map();
 const COLORS = [0xFF40C4FF, 0xFFFF5252, 0xFF69F0AE, 0xFFFFD740, 0xFFB388FF,
@@ -36,7 +38,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('Hungry Snake multiplayer server is running.');
 });
-const wss = new WebSocketServer({ server, path: '/game' });
+const wss = new WebSocketServer({ server, path: '/game', perMessageDeflate: false, maxPayload: 256 * 1024 });
 
 function safeName(value) {
   const name = String(value || 'Player').replace(/[<>\\\u0000-\u001f]/g, '').trim().slice(0, 18);
@@ -51,7 +53,7 @@ function clampInt(value, min, max, fallback) {
   return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 }
 function send(ws, data) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+  if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 512 * 1024) ws.send(JSON.stringify(data));
 }
 function broadcast(room, data, except = null) {
   const message = JSON.stringify(data);
@@ -111,7 +113,8 @@ function foodSnapshot(room) { return [...room.foods.values()]; }
 function getRoom(code) {
   if (!rooms.has(code)) {
     const room = { code, clients: new Set(), players: new Map(), bots: new Map(), foods: new Map(), fgrid: new Array(FGW * FGW),
-      nextBotId: 0, nextFoodId: 0, foodAdded: [], foodRemoved: [], broadcastT: 0, statsT: 0 };
+      nextBotId: 0, nextFoodId: 0, foodAdded: [], foodRemoved: [], broadcastT: 0, statsT: 0,
+      collisionGrid: new Array(CGW * CGW), collisionUsed: [] };
     for (let i = 0; i < FOOD_TARGET; i++) spawnFood(room);
     room.foodAdded.length = 0;
     rooms.set(code, room);
@@ -137,14 +140,24 @@ function ensureBots(room) {
   }
   while (room.bots.size < wanted) { const b = makeBot(room); room.bots.set(b.id, b); }
 }
-function snapshotWorm(w) {
-  return { id: w.id, name: w.name, x: Math.round(w.x), y: Math.round(w.y),
+function snapshotWorm(w, includeBody = false) {
+  const out = { id: w.id, name: w.name, x: Math.round(w.x), y: Math.round(w.y),
     angle: Math.round(w.angle * 100) / 100, boost: !!w.boost,
     score: Math.round(w.score * 10) / 10, color: w.color,
     head: (w.head === undefined || w.head === null) ? -1 : w.head, alive: w.alive !== false };
+  // إحداثيات الجسم مضغوطة: فروق عن الرأس بوحدة 2، لتقليل حجم اللقطات مع إبقاء شكل الجسم موحداً.
+  if (includeBody && w.body && w.body.length) {
+    const seg = new Array(w.body.length * 2);
+    for (let i = 0; i < w.body.length; i++) {
+      seg[i * 2] = Math.max(-32768, Math.min(32767, Math.round((w.body[i].x - w.x) / 2)));
+      seg[i * 2 + 1] = Math.max(-32768, Math.min(32767, Math.round((w.body[i].y - w.y) / 2)));
+    }
+    out.seg = seg;
+  }
+  return out;
 }
-function botSnapshot(room) { return [...room.bots.values()].filter(b => b.alive).map(snapshotWorm); }
-function playerSnapshot(room) { return [...room.players.values()].filter(p => p.alive).map(snapshotWorm); }
+function botSnapshot(room) { return [...room.bots.values()].filter(b => b.alive).map(b => snapshotWorm(b, true)); }
+function playerSnapshot(room) { return [...room.players.values()].filter(p => p.alive).map(p => snapshotWorm(p, true)); }
 function leave(ws) {
   const room = ws.room;
   if (!room) return;
@@ -203,20 +216,27 @@ function updateBot(room, bot, dt) {
     bot.think -= dt;
     const look = 260, ax = bot.x + Math.cos(bot.angle) * look, ay = bot.y + Math.sin(bot.angle) * look;
     let danger = null, dangerD = Infinity;
-    for (const group of [room.players, room.bots]) {
-      for (const other of group.values()) {
-        if (other.id === bot.id || other.alive === false) continue;
-        const dx = other.x - ax, dy = other.y - ay, d2 = dx * dx + dy * dy;
-        if (d2 < 210 * 210 && d2 < dangerD) { danger = other; dangerD = d2; }
-      }
+    for (const other of room.players.values()) {
+      if (other.alive === false) continue;
+      const dx = other.x - ax, dy = other.y - ay, d2 = dx * dx + dy * dy;
+      if (d2 < 210 * 210 && d2 < dangerD) { danger = other; dangerD = d2; }
+    }
+    for (const other of room.bots.values()) {
+      if (other.id === bot.id || other.alive === false) continue;
+      const dx = other.x - ax, dy = other.y - ay, d2 = dx * dx + dy * dy;
+      if (d2 < 210 * 210 && d2 < dangerD) { danger = other; dangerD = d2; }
     }
     if (danger) {
       const cross = Math.cos(bot.angle) * (danger.y - bot.y) - Math.sin(bot.angle) * (danger.x - bot.x);
       bot.target = bot.angle + (cross > 0 ? -1.35 : 1.35); bot.think = 0.25;
     } else if (bot.think <= 0) {
       bot.think = 0.45 + Math.random() * 0.75;
-      const nearest = [...room.players.values()].filter(p => p.alive)
-        .sort((a, b) => ((a.x - bot.x) ** 2 + (a.y - bot.y) ** 2) - ((b.x - bot.x) ** 2 + (b.y - bot.y) ** 2))[0];
+      let nearest = null, nearestD2 = Infinity;
+      for (const p of room.players.values()) {
+        if (p.alive === false) continue;
+        const dx = p.x - bot.x, dy = p.y - bot.y, d2 = dx * dx + dy * dy;
+        if (d2 < nearestD2) { nearestD2 = d2; nearest = p; }
+      }
       if (nearest && Math.random() < 0.22) bot.target = Math.atan2(nearest.y - bot.y, nearest.x - bot.x);
       else bot.target += (Math.random() - 0.5) * 1.5;
     }
@@ -255,28 +275,63 @@ function killWorm(room, w, reason) {
   }
 }
 function checkCollisions(room) {
-  const all = [...room.players.values(), ...room.bots.values()].filter(w => w.alive !== false);
+  const all = [];
+  for (const p of room.players.values()) if (p.alive !== false) all.push(p);
+  for (const b of room.bots.values()) if (b.alive !== false) all.push(b);
+  const grid = room.collisionGrid || (room.collisionGrid = new Array(CGW * CGW));
+  const used = room.collisionUsed || (room.collisionUsed = []);
+  for (let i = 0; i < used.length; i++) grid[used[i]].length = 0;
+  used.length = 0;
+
+  // إدراج كل مقطع في خلية مكانية؛ هذا يحوّل فحص جميع الأجسام إلى فحص الجوار فقط.
+  for (let wi = 0; wi < all.length; wi++) {
+    const w = all[wi], body = w.body || [];
+    for (let si = 0; si < body.length; si++) {
+      const q = body[si];
+      const gx = Math.max(0, Math.min(CGW - 1, (q.x / CCELL) | 0));
+      const gy = Math.max(0, Math.min(CGW - 1, (q.y / CCELL) | 0));
+      const cell = gy * CGW + gx;
+      let bucket = grid[cell];
+      if (!bucket) bucket = grid[cell] = [];
+      if (bucket.length === 0) used.push(cell);
+      bucket.push(wi * (MAX_SEGMENTS + 1) + si);
+    }
+  }
+
   const dying = [];
-  for (const w of all) {
+  for (let wi = 0; wi < all.length; wi++) {
+    const w = all[wi];
     if (Date.now() < (w.invulnUntil || 0)) continue;
     const rr = radius(w.score), cx = w.x - WORLD_CENTER, cy = w.y - WORLD_CENTER;
     const edge = ARENA_RADIUS - BORDER_R - rr * 0.3;
     if (cx * cx + cy * cy > edge * edge) { dying.push([w, 'border']); continue; }
+
+    const gx = Math.max(0, Math.min(CGW - 1, (w.x / CCELL) | 0));
+    const gy = Math.max(0, Math.min(CGW - 1, (w.y / CCELL) | 0));
     let dead = false;
-    for (const other of all) {
-      if (other === w || other.alive === false) continue;
-      const or = radius(other.score), dxh = other.x - w.x, dyh = other.y - w.y;
-      const headLimit = (rr + or) * 0.55;
-      if (dxh * dxh + dyh * dyh < headLimit * headLimit && w.score <= other.score) { dead = true; break; }
-      const body = other.body || [];
-      const quick = rr + or + 60;
-      if (w.x < other.minX - quick || w.x > other.maxX + quick || w.y < other.minY - quick || w.y > other.maxY + quick) continue;
-      for (let i = 1; i < body.length; i++) {
-        const dx = body[i].x - w.x, dy = body[i].y - w.y;
-        const lim = rr * HEAD_HIT + bodyRadius(other.score, i, body.length) * BODY_HIT;
-        if (dx * dx + dy * dy < lim * lim) { dead = true; break; }
+    for (let yy = Math.max(0, gy - 1); yy <= Math.min(CGW - 1, gy + 1) && !dead; yy++) {
+      for (let xx = Math.max(0, gx - 1); xx <= Math.min(CGW - 1, gx + 1) && !dead; xx++) {
+        const bucket = grid[yy * CGW + xx];
+        if (!bucket) continue;
+        for (let k = 0; k < bucket.length; k++) {
+          const packed = bucket[k];
+          const oi = Math.floor(packed / (MAX_SEGMENTS + 1));
+          const si = packed - oi * (MAX_SEGMENTS + 1);
+          const other = all[oi];
+          if (other === w || other.alive === false) continue;
+          const or = radius(other.score);
+          if (si === 0) {
+            const dx = other.x - w.x, dy = other.y - w.y;
+            const headLimit = (rr + or) * 0.55;
+            if (dx * dx + dy * dy < headLimit * headLimit && w.score <= other.score) { dead = true; break; }
+          } else {
+            const seg = other.body[si];
+            const dx = seg.x - w.x, dy = seg.y - w.y;
+            const lim = rr * HEAD_HIT + bodyRadius(other.score, si, other.body.length) * BODY_HIT;
+            if (dx * dx + dy * dy < lim * lim) { dead = true; break; }
+          }
+        }
       }
-      if (dead) break;
     }
     if (dead) dying.push([w, 'snake']);
   }
@@ -364,7 +419,7 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'joined', playerId: ws.playerId, room: code,
         players: playerSnapshot(room).filter(x => x.id !== p.id), bots: botSnapshot(room), foods: foodSnapshot(room),
         playerStats: { score: p.score, alive: true } });
-      broadcast(room, { type: 'player_joined', player: snapshotWorm(p) }, ws);
+      broadcast(room, { type: 'player_joined', player: snapshotWorm(p, true) }, ws);
       return;
     }
     if (msg.type === 'ping') return send(ws, { type: 'pong', t: msg.t });
@@ -372,16 +427,8 @@ wss.on('connection', (ws) => {
     if (msg.type === 'leave') { leave(ws); return; }
     if (msg.type === 'input') {
       const p = ws.room.players.get(ws.playerId); if (!p || p.alive === false) return;
-      const now = Date.now();
-      const el = Math.min(0.3, Math.max(0.02, (now - (p.lastInput || now - 40)) / 1000));
-      p.lastInput = now;
       const a = Number(msg.angle);
-      if (Number.isFinite(a)) {
-        // الجهاز يرسل اتجاهه الفعلي: نتبعه مباشرة (مع حد للدوران يمنع الغش) فيتطابق مسار السيرفر مع شاشة اللاعب
-        const maxTurn = 4.2 * (el + 0.12) * 1.5 + 0.1;
-        p.angle = turnToward(p.angle, clamp(a, -Math.PI * 8, Math.PI * 8, p.angle), maxTurn);
-        p.target = clamp(a, -Math.PI * 8, Math.PI * 8, p.angle);
-      }
+      if (Number.isFinite(a)) p.target = clamp(a, -Math.PI * 8, Math.PI * 8, p.target);
       p.boost = Boolean(msg.boost) && p.score > 6;
       return;
     }
@@ -401,6 +448,8 @@ function sendState(room) {
   const cache = new Map();
   for (const ws of room.clients) {
     if (ws.readyState !== WebSocket.OPEN) continue;
+    // لا نكدّس لقطات قديمة: الأحدث أهم من إرسال حالة عالم انتهى وقتها.
+    if (ws.bufferedAmount > 512 * 1024) continue;
     const me = room.players.get(ws.playerId);
     const cx = me ? me.x : WORLD_CENTER, cy = me ? me.y : WORLD_CENTER;
     const ps = [], bs = [];
@@ -410,26 +459,28 @@ function sendState(room) {
       const range = VIEW_RANGE + Math.min(2500, (w.body ? w.body.length : 10) * spacing(w.score) * 0.5);
       if (dx * dx + dy * dy > range * range) continue;
       let str = cache.get(w.id);
-      if (!str) { str = JSON.stringify(snapshotWorm(w)); cache.set(w.id, str); }
+      if (!str) { str = JSON.stringify(snapshotWorm(w, true)); cache.set(w.id, str); }
       (isBot ? bs : ps).push(str);
     }
-    const self = me ? JSON.stringify({ x: Math.round(me.x), y: Math.round(me.y),
-      angle: Math.round(me.angle * 100) / 100, score: Math.round(me.score * 10) / 10, alive: me.alive !== false }) : 'null';
-    ws.send('{"type":"state","players":[' + ps.join(',') + '],"bots":[' + bs.join(',') + '],"self":' + self + '}');
+    // نرسل جسم اللاعب نفسه أيضاً حتى يصحح جهازه جسمه المحلي إلى هندسة السيرفر ذاتها.
+    const self = me ? JSON.stringify(snapshotWorm(me, true)) : 'null';
+    ws.send('{"type":"state","serverTime":' + Date.now() + ',"players":[' + ps.join(',') + '],"bots":[' + bs.join(',') + '],"self":' + self + '}');
   }
 }
 
-const tickStats = { sum: 0, n: 0, max: 0 };
+const tickStats = { sum: 0, n: 0, max: 0, intervalMax: 0 };
 let lastTick = Date.now();
 setInterval(() => {
-  const now = Date.now(), dt = Math.min(0.1, Math.max(0.001, (now - lastTick) / 1000)); lastTick = now;
+  const now = Date.now(), elapsedMs = now - lastTick;
+  const dt = Math.min(0.1, Math.max(0.001, elapsedMs / 1000)); lastTick = now;
+  tickStats.intervalMax = Math.max(tickStats.intervalMax, elapsedMs);
   const tickStart = process.hrtime.bigint();
   for (const room of rooms.values()) {
     if (!room.clients.size) continue;
     processRoom(room, dt);
     room.broadcastT += dt * 1000;
     if (room.broadcastT >= BROADCAST_MS) {
-      room.broadcastT = 0;
+      room.broadcastT %= BROADCAST_MS;
       sendState(room);
       if (room.foodAdded.length || room.foodRemoved.length) {
         const removedIds = new Set(room.foodRemoved);
@@ -442,8 +493,8 @@ setInterval(() => {
   const ms = Number(process.hrtime.bigint() - tickStart) / 1e6;
   tickStats.sum += ms; tickStats.n++; tickStats.max = Math.max(tickStats.max, ms);
   if (tickStats.n >= 150) {            // كل ~5 ثوان: متوسط وأقصى زمن لحلقة السيرفر (مفيد لمراقبة الأداء في Railway Logs)
-    if (process.env.DEBUG_TICKS) console.log(`tick avg ${(tickStats.sum / tickStats.n).toFixed(2)}ms max ${tickStats.max.toFixed(2)}ms`);
-    tickStats.sum = 0; tickStats.n = 0; tickStats.max = 0;
+    if (process.env.DEBUG_TICKS) console.log(`tick work avg ${(tickStats.sum / tickStats.n).toFixed(2)}ms max ${tickStats.max.toFixed(2)}ms | interval max ${tickStats.intervalMax.toFixed(0)}ms | rooms=${rooms.size} clients=${wss.clients.size}`);
+    tickStats.sum = 0; tickStats.n = 0; tickStats.max = 0; tickStats.intervalMax = 0;
   }
 }, BOT_TICK_MS);
 
