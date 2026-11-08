@@ -13,11 +13,12 @@ const ARENA_RADIUS = WORLD_SIZE / 2;
 const BORDER_R = 30;
 const HEAD_HIT = 0.45;
 const BODY_HIT = 0.78;
-const BOT_TICK_MS = 50;
+const BOT_TICK_MS = 33;                 // محاكاة 30 مرة في الثانية
 const BROADCAST_MS = 100;
 const MIN_MOVE_INTERVAL_MS = 25;
-const FOOD_TARGET = 1500;
-const MAX_FOOD = 4000;
+const FOOD_TARGET = 3000;
+const MAX_FOOD = 8000;
+const VIEW_RANGE = 3200;                // نرسل لكل لاعب من حوله فقط (يقلل البيانات كثيراً)
 const MAX_SEGMENTS = 350;
 const rooms = new Map();
 const COLORS = [0xFF40C4FF, 0xFFFF5252, 0xFF69F0AE, 0xFFFFD740, 0xFFB388FF,
@@ -124,12 +125,18 @@ function makeBot(room) {
 }
 function ensureBots(room) {
   const wanted = Math.max(0, TARGET_POPULATION - room.players.size);
-  while (room.bots.size > wanted) room.bots.delete(room.bots.keys().next().value);
+  while (room.bots.size > wanted) {
+    const id = room.bots.keys().next().value;
+    room.bots.delete(id);
+    broadcast(room, { type: 'worm_dead', id });
+  }
   while (room.bots.size < wanted) { const b = makeBot(room); room.bots.set(b.id, b); }
 }
 function snapshotWorm(w) {
-  return { id: w.id, name: w.name, x: w.x, y: w.y, angle: w.angle, boost: !!w.boost,
-    score: w.score, color: w.color, head: w.head || -1, alive: w.alive !== false };
+  return { id: w.id, name: w.name, x: Math.round(w.x), y: Math.round(w.y),
+    angle: Math.round(w.angle * 100) / 100, boost: !!w.boost,
+    score: Math.round(w.score * 10) / 10, color: w.color,
+    head: (w.head === undefined || w.head === null) ? -1 : w.head, alive: w.alive !== false };
 }
 function botSnapshot(room) { return [...room.bots.values()].filter(b => b.alive).map(snapshotWorm); }
 function playerSnapshot(room) { return [...room.players.values()].filter(p => p.alive).map(snapshotWorm); }
@@ -174,6 +181,14 @@ function followBody(w) {
     cur.x = prev.x + dx / d * gap;
     cur.y = prev.y + dy / d * gap;
   }
+}
+// حركة اللاعب يحسبها السيرفر: الجهاز يرسل الاتجاه المطلوب والتسريع فقط (input).
+function stepPlayer(p, dt) {
+  p.angle = turnToward(p.angle, p.target, 4.2 * dt);
+  const speed = (p.boost && p.score > 6) ? 340 : 190;
+  p.x += Math.cos(p.angle) * speed * dt;
+  p.y += Math.sin(p.angle) * speed * dt;
+  followBody(p);
 }
 function updateBot(room, bot, dt) {
   const cx = bot.x - WORLD_CENTER, cy = bot.y - WORLD_CENTER;
@@ -226,6 +241,7 @@ function killWorm(room, w, reason) {
   dropBody(room, w);
   if (w.id.startsWith('bot-')) {
     w.respawnAt = Date.now() + 3000;
+    broadcast(room, { type: 'worm_dead', id: w.id });
   } else {
     const ws = [...room.clients].find(c => c.playerId === w.id);
     if (ws) send(ws, { type: 'player_dead', playerId: w.id, score: w.score, reason: reason || 'collision' });
@@ -301,9 +317,7 @@ function processRoom(room, dt) {
   }
   for (const p of room.players.values()) {
     if (p.alive === false) continue;
-    if (p.boost && p.score > 6) {
-      // player body is client-supplied; its head movement remains driven by the player's controls.
-    }
+    stepPlayer(p, dt);
     updateFoodAndGrowth(room, p, dt);
     updateBounds(p);
   }
@@ -327,7 +341,7 @@ wss.on('connection', (ws) => {
       ws.room = room; ws.playerName = safeName(msg.name); room.clients.add(ws);
       const p = { id: ws.playerId, name: ws.playerName, x: clamp(msg.x, 0, WORLD_SIZE, WORLD_CENTER),
         y: clamp(msg.y, 0, WORLD_SIZE, WORLD_CENTER), angle: clamp(msg.angle, -Math.PI * 4, Math.PI * 4, 0),
-        boost: false, score: 10, color: clampInt(msg.color, -2147483648, 2147483647, 0xFF40C4FF),
+        boost: false, score: 10, target: clamp(msg.angle, -Math.PI * 4, Math.PI * 4, 0), color: clampInt(msg.color, -2147483648, 2147483647, 0xFF40C4FF),
         head: clampInt(msg.head, -1, 99, -1), body: [], alive: true, invulnUntil: Date.now() + 2500, dropT: 0 };
       p.body = makeBody(p.x, p.y, p.angle, p.score); parseBody(msg.segments, p);
       room.players.set(ws.playerId, p); ensureBots(room);
@@ -340,16 +354,46 @@ wss.on('connection', (ws) => {
     if (msg.type === 'ping') return send(ws, { type: 'pong' });
     if (!ws.room) return send(ws, { type: 'error', message: 'Join a room first' });
     if (msg.type === 'leave') { leave(ws); return; }
-    if (msg.type === 'move') {
-      const now = Date.now(); if (now - ws.lastMove < MIN_MOVE_INTERVAL_MS) return; ws.lastMove = now;
+    if (msg.type === 'input') {
       const p = ws.room.players.get(ws.playerId); if (!p || p.alive === false) return;
-      applyPlayerState(p, msg);
-      updateBounds(p);
-      broadcast(ws.room, { type: 'player_moved', player: snapshotWorm(p) }, ws);
+      const a = Number(msg.angle);
+      if (Number.isFinite(a)) p.target = clamp(a, -Math.PI * 8, Math.PI * 8, p.target);
+      p.boost = Boolean(msg.boost) && p.score > 6;
+      return;
+    }
+    if (msg.type === 'move') {        // رسالة قديمة: لا نقبل الموقع من الجهاز، فقط اللون والرأس
+      const p = ws.room.players.get(ws.playerId); if (!p) return;
+      if (msg.color !== undefined) p.color = clampInt(msg.color, -2147483648, 2147483647, p.color);
+      if (msg.head !== undefined) p.head = clampInt(msg.head, -1, 99, p.head);
     }
   });
   ws.on('close', () => leave(ws)); ws.on('error', () => leave(ws));
 });
+
+function sendState(room) {
+  const snaps = [];
+  for (const p of room.players.values()) if (p.alive !== false) snaps.push([p, false]);
+  for (const b of room.bots.values()) if (b.alive !== false) snaps.push([b, true]);
+  const cache = new Map();
+  for (const ws of room.clients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    const me = room.players.get(ws.playerId);
+    const cx = me ? me.x : WORLD_CENTER, cy = me ? me.y : WORLD_CENTER;
+    const ps = [], bs = [];
+    for (const [w, isBot] of snaps) {
+      if (w.id === ws.playerId) continue;
+      const dx = w.x - cx, dy = w.y - cy;
+      const range = VIEW_RANGE + Math.min(2500, (w.body ? w.body.length : 10) * spacing(w.score) * 0.5);
+      if (dx * dx + dy * dy > range * range) continue;
+      let str = cache.get(w.id);
+      if (!str) { str = JSON.stringify(snapshotWorm(w)); cache.set(w.id, str); }
+      (isBot ? bs : ps).push(str);
+    }
+    const self = me ? JSON.stringify({ x: Math.round(me.x), y: Math.round(me.y),
+      angle: Math.round(me.angle * 100) / 100, score: Math.round(me.score * 10) / 10, alive: me.alive !== false }) : 'null';
+    ws.send('{"type":"state","players":[' + ps.join(',') + '],"bots":[' + bs.join(',') + '],"self":' + self + '}');
+  }
+}
 
 let lastTick = Date.now();
 setInterval(() => {
@@ -357,23 +401,15 @@ setInterval(() => {
   for (const room of rooms.values()) {
     if (!room.clients.size) continue;
     processRoom(room, dt);
-    room.broadcastT += now - (room.lastBroadcastAt || now); room.lastBroadcastAt = now;
-    room.statsT += dt;
+    room.broadcastT += dt * 1000;
     if (room.broadcastT >= BROADCAST_MS) {
       room.broadcastT = 0;
-      broadcast(room, { type: 'bot_state', bots: botSnapshot(room) });
+      sendState(room);
       if (room.foodAdded.length || room.foodRemoved.length) {
         const removedIds = new Set(room.foodRemoved);
         const additions = room.foodAdded.filter(f => !removedIds.has(f.id));
         broadcast(room, { type: 'food_delta', add: additions, remove: room.foodRemoved });
         room.foodAdded = []; room.foodRemoved = [];
-      }
-    }
-    if (room.statsT >= 0.5) {
-      room.statsT = 0;
-      for (const p of room.players.values()) {
-        const ws = [...room.clients].find(c => c.playerId === p.id);
-        if (ws) send(ws, { type: 'player_stats', score: p.score, alive: p.alive !== false });
       }
     }
   }
