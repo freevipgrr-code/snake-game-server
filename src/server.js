@@ -562,6 +562,15 @@ wss.on('connection', (ws) => {
   ws.on('close', () => leave(ws)); ws.on('error', () => leave(ws));
 });
 
+function bodyNear(w, cx, cy) {
+  const R = VIEW_RANGE + radius(w.score);
+  if (w.maxX < cx - R || w.minX > cx + R || w.maxY < cy - R || w.minY > cy + R) return false;
+  const body = w.body || [];
+  for (let i = 0; i < body.length; i += 2) {
+    if (Math.abs(body[i].x - cx) < R && Math.abs(body[i].y - cy) < R) return true;
+  }
+  return false;
+}
 function sendState(room) {
   const snaps = [];
   for (const p of room.players.values()) if (p.alive !== false) snaps.push([p, false]);
@@ -578,7 +587,8 @@ function sendState(room) {
       if (w.id === ws.playerId) continue;
       const dx = w.x - cx, dy = w.y - cy;
       const range = VIEW_RANGE + Math.min(2500, (w.body ? w.body.length : 10) * spacing(w.score) * 0.5);
-      if (dx * dx + dy * dy > range * range) continue;
+      // الرأس بعيد لكن الجسم الطويل قد يمر بجانب اللاعب: لا نخفيه (كان هذا يسبب أفاعي مخفية تقتل اللاعب)
+      if (dx * dx + dy * dy > range * range && !bodyNear(w, cx, cy)) continue;
       let str = cache.get(w.id);
       if (!str) { str = JSON.stringify(snapshotWorm(w, true)); cache.set(w.id, str); }
       (isBot ? bs : ps).push(str);
