@@ -188,19 +188,40 @@ function turnToward(current, target, maxTurn) {
   while (d < -Math.PI) d += Math.PI * 2;
   return current + Math.max(-maxTurn, Math.min(maxTurn, d));
 }
+// الجسم يتبع مسار الرأس الفعلي (مثل العميل تماماً) بدل سلسلة حبل تقطع المنعطفات:
+// نخزّن نقاط مسار الرأس ونوزّع الحلقات عليه بمسافات متساوية. هذا يطابق ما يراه اللاعب فلا يخترقه أحد.
 function followBody(w) {
   const n = segmentCount(w.score), gap = spacing(w.score);
   if (!w.body || !w.body.length) w.body = makeBody(w.x, w.y, w.angle, w.score);
-  w.body[0] = { x: w.x, y: w.y };
-  while (w.body.length < n) w.body.push({ ...w.body[w.body.length - 1] });
-  if (w.body.length > n) w.body.length = n;
-  for (let i = 1; i < n; i++) {
-    const prev = w.body[i - 1], cur = w.body[i];
-    let dx = cur.x - prev.x, dy = cur.y - prev.y, d = Math.hypot(dx, dy);
-    if (d < 0.001) { dx = -Math.cos(w.angle); dy = -Math.sin(w.angle); d = 1; }
-    cur.x = prev.x + dx / d * gap;
-    cur.y = prev.y + dy / d * gap;
+  if (!w.path) w.path = w.body.map(s => ({ x: s.x, y: s.y }));
+  const path = w.path, h = path[0];
+  if (Math.hypot(w.x - h.x, w.y - h.y) >= 1) path.unshift({ x: w.x, y: w.y });
+  else { h.x = w.x; h.y = w.y; }
+  const body = w.body;
+  let cnt = 0;
+  const put = (x, y) => {
+    const s = body[cnt];
+    if (s) { s.x = x; s.y = y; } else body[cnt] = { x, y };
+    cnt++;
+  };
+  put(w.x, w.y);
+  const limit = (n + 8) * gap;
+  let need = gap, acc = 0, kEnd = path.length - 1;
+  for (let k = 0; k + 1 < path.length; k++) {
+    const a = path[k], b = path[k + 1];
+    const sx = b.x - a.x, sy = b.y - a.y, sl = Math.hypot(sx, sy);
+    if (sl < 1e-6) continue;
+    while (cnt < n && acc + sl >= need) {
+      const t = (need - acc) / sl;
+      put(a.x + sx * t, a.y + sy * t);
+      need += gap;
+    }
+    acc += sl;
+    if (acc >= limit) { kEnd = k + 1; break; }
   }
+  path.length = kEnd + 1;                      // نقص طول المسار الزائد
+  while (cnt < n) { const l = body[cnt - 1]; put(l.x, l.y); }
+  body.length = n;
 }
 // حركة اللاعب يحسبها السيرفر: الجهاز يرسل الاتجاه المطلوب والتسريع فقط (input).
 function stepPlayer(p, dt) {
@@ -421,7 +442,7 @@ function updateFoodAndGrowth(room, w, dt) {
 function respawnBot(room, bot) {
   const p = randomPoint(); bot.x = p.x; bot.y = p.y; bot.angle = bot.target = Math.random() * Math.PI * 2;
   bot.score = 5 + Math.floor(Math.random() * 35); bot.body = makeBody(bot.x, bot.y, bot.angle, bot.score);
-  bot.alive = true; bot.invulnUntil = Date.now() + 1500; bot.dropT = 0;
+  bot.alive = true; bot.invulnUntil = Date.now() + 1500; bot.dropT = 0; bot.path = null;
 }
 function processRoom(room, dt) {
   const now = Date.now();
