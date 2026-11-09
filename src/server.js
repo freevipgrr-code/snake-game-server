@@ -6,7 +6,7 @@ const { randomUUID } = require('crypto');
 
 const PORT = Number(process.env.PORT || 2567);
 const MAX_PLAYERS_PER_ROOM = 100;
-const TARGET_POPULATION = 100;
+const TARGET_POPULATION = 50;      // العدد الكلي (بوتات + لاعبون): عدد البوتات = 50 - اللاعبون
 const WORLD_SIZE = 12000;
 const WORLD_CENTER = WORLD_SIZE / 2;
 const ARENA_RADIUS = WORLD_SIZE / 2;
