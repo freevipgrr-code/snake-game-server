@@ -15,6 +15,10 @@ const BORDER_R = 30;
 const HEAD_HIT = 0.95;                   // نصف قطر رأس الضحية
 const BODY_HIT = 1.0;                    // نصف قطر جسم الخصم
 const HEAD_TOUCH = 0.9;                  // رأس برأس
+// تعويض التأخر: جهاز اللاعب يعرض ثعبانه متقدماً عن السيرفر بنحو نصف زمن الذهاب والإياب (ping/2).
+// نختبر اصطدام ثعبان اللاعب (رأساً وجسماً) في موضعه المتقدم ليطابق ما يراه على شاشته. السقف يمنع المبالغة.
+const LAG_COMP = 1.0;                    // 0 = إيقاف التعويض
+const MAX_LAG_S = 0.15;                  // أقصى تقدّم بالثواني
 const BOT_TICK_MS = 33;                 // محاكاة 30 مرة في الثانية
 const BROADCAST_MS = 60;                 // لقطة العالم ~15 مرة في الثانية
 const MIN_MOVE_INTERVAL_MS = 25;
@@ -312,20 +316,21 @@ function sampleHit(w, all, grid, hx, hy, rr) {
         const other = all[oi];
         if (other === w || other.alive === false) continue;
         const or = radius(other.score);
+        const ob = other.cb;
         if (si === 0) {                       // رأس برأس: الأصغر يموت، وعند التساوي يموتان
-          const dx = other.x - hx, dy = other.y - hy, lim = (rr + or) * HEAD_TOUCH;
+          const dx = ob[0].x - hx, dy = ob[0].y - hy, lim = (rr + or) * HEAD_TOUCH;
           if (dx * dx + dy * dy < lim * lim && w.score <= other.score) return true;
           continue;
         }
-        const seg = other.body[si];
+        const seg = ob[si];
         const dx = seg.x - hx, dy = seg.y - hy, d2 = dx * dx + dy * dy;
         const reach = rr + or + spacing(other.score);
         if (d2 > reach * reach) continue;     // بعيد جداً: لا نحسب الأنصاف
-        const n = other.body.length, bRad = bodyRadius(other.score, si, n);
+        const n = ob.length, bRad = bodyRadius(other.score, si, n);
         const lim = rr * HEAD_HIT + bRad * BODY_HIT;
         if (d2 < lim * lim) return true;
         if (si >= 2) {                        // المسافة إلى القطعة بين حلقتين: لا ثغرات خصوصاً عند الذيل الرفيع
-          const prev = other.body[si - 1];
+          const prev = ob[si - 1];
           const sx = seg.x - prev.x, sy = seg.y - prev.y, l2 = sx * sx + sy * sy;
           if (l2 > 1e-6) {
             let t = ((hx - prev.x) * sx + (hy - prev.y) * sy) / l2;
@@ -341,6 +346,35 @@ function sampleHit(w, all, grid, hx, hy, rr) {
   }
   return false;
 }
+// جسم اللاعب كما يراه على جهازه: متقدم على مساره بمقدار سرعته × التأخر (رأسه يمتد للأمام باتجاه حركته)
+function lagBody(w) {
+  const n = w.body.length, gap = spacing(w.score);
+  const speed = (w.boost && w.score > 6) ? 340 : 190;
+  const d = speed * Math.min(MAX_LAG_S, w.lag) * LAG_COMP;
+  const out = w.lagb || (w.lagb = []);
+  let cnt = 0;
+  const put = (x, y) => { const s = out[cnt]; if (s) { s.x = x; s.y = y; } else out[cnt] = { x, y }; cnt++; };
+  const dx = Math.cos(w.angle), dy = Math.sin(w.angle);
+  while (cnt < n && cnt * gap - d < 0) put(w.x - dx * (cnt * gap - d), w.y - dy * (cnt * gap - d));
+  const path = w.path;
+  if (path && path.length > 1) {
+    let need = cnt * gap - d, acc = 0;
+    for (let k = 0; k + 1 < path.length && cnt < n; k++) {
+      const a = path[k], b = path[k + 1];
+      const sx = b.x - a.x, sy = b.y - a.y, sl = Math.hypot(sx, sy);
+      if (sl < 1e-6) continue;
+      while (cnt < n && acc + sl >= need) {
+        const t = (need - acc) / sl;
+        put(a.x + sx * t, a.y + sy * t);
+        need += gap;
+      }
+      acc += sl;
+    }
+  }
+  while (cnt < n) { const l = cnt ? out[cnt - 1] : { x: w.x, y: w.y }; put(l.x, l.y); }
+  out.length = n;
+  return out;
+}
 function checkCollisions(room) {
   const all = [];
   for (const p of room.players.values()) if (p.alive !== false) all.push(p);
@@ -351,9 +385,19 @@ function checkCollisions(room) {
   for (let i = 0; i < used.length; i++) grid[used[i]].length = 0;
   used.length = 0;
 
+  // جسم الاصطدام: للاعب المتأخر = جسمه المتقدم (كما يراه)، وللبوت = جسمه الفعلي
+  for (let wi = 0; wi < all.length; wi++) {
+    const w = all[wi];
+    if (w.lag > 0.004 && w.body && w.body.length > 1) w.cb = lagBody(w);
+    else {
+      w.cb = w.body || [];
+      if (w.cb[0]) { w.cb[0].x = w.x; w.cb[0].y = w.y; }       // الرأس دائماً عند موضعه الفعلي
+    }
+  }
+
   // إدراج المقاطع في الشبكة المكانية بأمان
   for (let wi = 0; wi < all.length; wi++) {
-    const w = all[wi], body = w.body || [];
+    const w = all[wi], body = w.cb;
     for (let si = 0; si < body.length; si++) {
       const q = body[si];
       // حماية صارمة ضد خروج الإحداثيات عن حدود الشبكة
@@ -383,9 +427,10 @@ function checkCollisions(room) {
     }
 
     // نفحص نقاطاً بين موقع الرأس في الإطار السابق والحالي كي لا يعبر الرأس الجسم بين إطارين (خصوصاً بالتسريع)
-    let dead = sampleHit(w, all, grid, w.x, w.y, rr);
+    const hx = w.cb[0] ? w.cb[0].x : w.x, hy = w.cb[0] ? w.cb[0].y : w.y;
+    let dead = sampleHit(w, all, grid, hx, hy, rr);
     if (!dead && w.px !== undefined) {
-      const mx = w.x - w.px, my = w.y - w.py, md = Math.hypot(mx, my);
+      const mx = hx - w.px, my = hy - w.py, md = Math.hypot(mx, my);
       if (md < 80) {
         const n = Math.min(4, Math.floor(md / (rr * 0.5)));
         for (let k = 1; k <= n && !dead; k++) {
@@ -400,7 +445,7 @@ function checkCollisions(room) {
   for (const [w, reason] of dying) {
     killWorm(room, w, reason);
   }
-  for (let i = 0; i < all.length; i++) { all[i].px = all[i].x; all[i].py = all[i].y; }
+  for (let i = 0; i < all.length; i++) { const h = all[i].cb[0] || all[i]; all[i].px = h.x; all[i].py = h.y; }
 }
 function updateBounds(w) {
   const body = w.body || [];
@@ -464,7 +509,17 @@ function processRoom(room, dt) {
 
 wss.on('connection', (ws) => {
   ws.playerId = randomUUID(); ws.isAlive = true; ws.lastMove = 0;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    if (ws.pingAt) {                          // قياس زمن الذهاب والإياب في السيرفر (لا نصدّق رقماً يرسله الجهاز)
+      const r = (Date.now() - ws.pingAt) / 1000;
+      ws.pingAt = 0;
+      ws.rtt = ws.rtt === undefined ? r : ws.rtt * 0.6 + r * 0.4;
+      const pl = ws.room && ws.room.players.get(ws.playerId);
+      if (pl) pl.lag = Math.min(MAX_LAG_S, ws.rtt / 2);
+    }
+  });
+  ws.pingAt = Date.now(); ws.ping();
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return send(ws, { type: 'error', message: 'Invalid JSON' }); }
@@ -478,7 +533,8 @@ wss.on('connection', (ws) => {
       const p = { id: ws.playerId, name: ws.playerName, x: clamp(msg.x, 0, WORLD_SIZE, WORLD_CENTER),
         y: clamp(msg.y, 0, WORLD_SIZE, WORLD_CENTER), angle: clamp(msg.angle, -Math.PI * 4, Math.PI * 4, 0),
         boost: false, score: 10, target: clamp(msg.angle, -Math.PI * 4, Math.PI * 4, 0), color: clampInt(msg.color, -2147483648, 2147483647, 0xFF40C4FF),
-        head: clampInt(msg.head, -1, 99, -1), body: [], alive: true, invulnUntil: Date.now() + 2500, dropT: 0 };
+        head: clampInt(msg.head, -1, 99, -1), body: [], alive: true, invulnUntil: Date.now() + 2500, dropT: 0,
+        lag: Math.min(MAX_LAG_S, (ws.rtt || 0) / 2) };
       p.body = makeBody(p.x, p.y, p.angle, p.score); parseBody(msg.segments, p);
       room.players.set(ws.playerId, p); ensureBots(room);
       send(ws, { type: 'joined', playerId: ws.playerId, room: code,
@@ -563,6 +619,10 @@ setInterval(() => {
   }
 }, BOT_TICK_MS);
 
+const rttTimer = setInterval(() => {
+  for (const ws of wss.clients) if (ws.readyState === WebSocket.OPEN) { ws.pingAt = Date.now(); ws.ping(); }
+}, 1000);
+wss.on('close', () => clearInterval(rttTimer));
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) { if (!ws.isAlive) { ws.terminate(); continue; } ws.isAlive = false; ws.ping(); }
 }, 30000);
