@@ -11,8 +11,10 @@ const WORLD_SIZE = 12000;
 const WORLD_CENTER = WORLD_SIZE / 2;
 const ARENA_RADIUS = WORLD_SIZE / 2;
 const BORDER_R = 30;
-const HEAD_HIT = 0.45;
-const BODY_HIT = 0.78;
+// 1.0 = الموت لحظة التماس البصري بين الحافتين (أقل = أسمح قليلاً، أكثر = أصرم)
+const HEAD_HIT = 0.95;                   // نصف قطر رأس الضحية
+const BODY_HIT = 1.0;                    // نصف قطر جسم الخصم
+const HEAD_TOUCH = 0.9;                  // رأس برأس
 const BOT_TICK_MS = 33;                 // محاكاة 30 مرة في الثانية
 const BROADCAST_MS = 60;                 // لقطة العالم ~15 مرة في الثانية
 const MIN_MOVE_INTERVAL_MS = 25;
@@ -274,6 +276,50 @@ function killWorm(room, w, reason) {
     broadcast(room, { type: 'player_dead', playerId: w.id, score: w.score, reason: reason || 'collision' }, ws || null);
   }
 }
+// هل رأس w عند (hx,hy) يلمس ثعباناً آخر؟ (يموت فوراً عند التماس)
+function sampleHit(w, all, grid, hx, hy, rr) {
+  const gx = Math.max(0, Math.min(CGW - 1, Math.floor(hx / CCELL)));
+  const gy = Math.max(0, Math.min(CGW - 1, Math.floor(hy / CCELL)));
+  for (let yy = Math.max(0, gy - 1); yy <= Math.min(CGW - 1, gy + 1); yy++) {
+    for (let xx = Math.max(0, gx - 1); xx <= Math.min(CGW - 1, gx + 1); xx++) {
+      const bucket = grid[yy * CGW + xx];
+      if (!bucket) continue;
+      for (let k = 0; k < bucket.length; k++) {
+        const packed = bucket[k];
+        const oi = Math.floor(packed / (MAX_SEGMENTS + 1));
+        const si = packed - oi * (MAX_SEGMENTS + 1);
+        const other = all[oi];
+        if (other === w || other.alive === false) continue;
+        const or = radius(other.score);
+        if (si === 0) {                       // رأس برأس: الأصغر يموت، وعند التساوي يموتان
+          const dx = other.x - hx, dy = other.y - hy, lim = (rr + or) * HEAD_TOUCH;
+          if (dx * dx + dy * dy < lim * lim && w.score <= other.score) return true;
+          continue;
+        }
+        const seg = other.body[si];
+        const dx = seg.x - hx, dy = seg.y - hy, d2 = dx * dx + dy * dy;
+        const reach = rr + or + spacing(other.score);
+        if (d2 > reach * reach) continue;     // بعيد جداً: لا نحسب الأنصاف
+        const n = other.body.length, bRad = bodyRadius(other.score, si, n);
+        const lim = rr * HEAD_HIT + bRad * BODY_HIT;
+        if (d2 < lim * lim) return true;
+        if (si >= 2) {                        // المسافة إلى القطعة بين حلقتين: لا ثغرات خصوصاً عند الذيل الرفيع
+          const prev = other.body[si - 1];
+          const sx = seg.x - prev.x, sy = seg.y - prev.y, l2 = sx * sx + sy * sy;
+          if (l2 > 1e-6) {
+            let t = ((hx - prev.x) * sx + (hy - prev.y) * sy) / l2;
+            t = t < 0 ? 0 : (t > 1 ? 1 : t);
+            const qx = prev.x + sx * t - hx, qy = prev.y + sy * t - hy;
+            const pr = bodyRadius(other.score, si - 1, n), rad = pr + (bRad - pr) * t;
+            const lim2 = rr * HEAD_HIT + rad * BODY_HIT;
+            if (qx * qx + qy * qy < lim2 * lim2) return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
 function checkCollisions(room) {
   const all = [];
   for (const p of room.players.values()) if (p.alive !== false) all.push(p);
@@ -315,52 +361,15 @@ function checkCollisions(room) {
       continue;
     }
 
-    const gx = Math.max(0, Math.min(CGW - 1, Math.floor(w.x / CCELL)));
-    const gy = Math.max(0, Math.min(CGW - 1, Math.floor(w.y / CCELL)));
-    let dead = false;
-
-    // فحص الخلايا المجاورة بدقة
-    for (let yy = Math.max(0, gy - 1); yy <= Math.min(CGW - 1, gy + 1) && !dead; yy++) {
-      for (let xx = Math.max(0, gx - 1); xx <= Math.min(CGW - 1, gx + 1) && !dead; xx++) {
-        const bucket = grid[yy * CGW + xx];
-        if (!bucket) continue;
-        
-        for (let k = 0; k < bucket.length; k++) {
-          const packed = bucket[k];
-          const oi = Math.floor(packed / (MAX_SEGMENTS + 1));
-          const si = packed - oi * (MAX_SEGMENTS + 1);
-          const other = all[oi];
-
-          // لا تصطدم الأفعى بنفسها، ولا بالأجسام الميتة
-          if (other === w || other.alive === false) continue;
-          
-          const or = radius(other.score);
-
-          if (si === 0) {
-            // تصادم الرأس برأس (Head-to-Head)
-            const dx = other.x - w.x, dy = other.y - w.y;
-            const headLimit = (rr + or) * 0.50; // تقليل الهامش قليلاً لزيادة العدالة
-            if (dx * dx + dy * dy < headLimit * headLimit) {
-              // يموت الأصغر حجماً، أو يمتان معاً إذا تساويا
-              if (w.score <= other.score) {
-                dead = true;
-                break;
-              }
-            }
-          } else {
-            // تصادم الرأس بجسم أفعى أخرى (Head-to-Body)
-            const seg = other.body[si];
-            const dx = seg.x - w.x, dy = seg.y - w.y;
-            
-            // حساب المسافة بدقة مع مراعاة تدرج حجم الحلقات
-            const bRad = bodyRadius(other.score, si, other.body.length);
-            const lim = (rr * HEAD_HIT) + (bRad * BODY_HIT);
-            
-            if (dx * dx + dy * dy < lim * lim) {
-              dead = true;
-              break;
-            }
-          }
+    // نفحص نقاطاً بين موقع الرأس في الإطار السابق والحالي كي لا يعبر الرأس الجسم بين إطارين (خصوصاً بالتسريع)
+    let dead = sampleHit(w, all, grid, w.x, w.y, rr);
+    if (!dead && w.px !== undefined) {
+      const mx = w.x - w.px, my = w.y - w.py, md = Math.hypot(mx, my);
+      if (md < 80) {
+        const n = Math.min(4, Math.floor(md / (rr * 0.5)));
+        for (let k = 1; k <= n && !dead; k++) {
+          const f = k / (n + 1);
+          dead = sampleHit(w, all, grid, w.px + mx * f, w.py + my * f, rr);
         }
       }
     }
@@ -370,6 +379,7 @@ function checkCollisions(room) {
   for (const [w, reason] of dying) {
     killWorm(room, w, reason);
   }
+  for (let i = 0; i < all.length; i++) { all[i].px = all[i].x; all[i].py = all[i].y; }
 }
 function updateBounds(w) {
   const body = w.body || [];
